@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
 import os
 import time
 from contextlib import AsyncExitStack, nullcontext
@@ -16,24 +15,25 @@ from loguru import logger
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.hook import AgentHook, AgentHookContext, CompositeHook
 from nanobot.agent.memory import MemoryConsolidator
-from nanobot.agent.runner import AgentRunSpec, AgentRunner
+from nanobot.agent.runner import AgentRunner, AgentRunSpec
+from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.cron import CronTool
-from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
+from nanobot.agent.tools.kb import KBIngestTool, KBSearchTool
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
-from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
 from nanobot.bus.queue import MessageBus
+from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
 from nanobot.providers.base import LLMProvider
 from nanobot.session.manager import Session, SessionManager
 
 if TYPE_CHECKING:
-    from nanobot.config.schema import ChannelsConfig, ExecToolConfig, WebSearchConfig
+    from nanobot.config.schema import ChannelsConfig, ExecToolConfig, KBConfig, WebSearchConfig
     from nanobot.cron.service import CronService
 
 
@@ -176,6 +176,7 @@ class AgentLoop:
         web_search_config: WebSearchConfig | None = None,
         web_proxy: str | None = None,
         exec_config: ExecToolConfig | None = None,
+        kb_config: KBConfig | None = None,
         cron_service: CronService | None = None,
         restrict_to_workspace: bool = False,
         session_manager: SessionManager | None = None,
@@ -184,7 +185,8 @@ class AgentLoop:
         timezone: str | None = None,
         hooks: list[AgentHook] | None = None,
     ):
-        from nanobot.config.schema import ExecToolConfig, WebSearchConfig
+        from nanobot.config.schema import ExecToolConfig, KBConfig, WebSearchConfig
+        from nanobot.kb.store import KnowledgeStore
 
         self.bus = bus
         self.channels_config = channels_config
@@ -196,6 +198,7 @@ class AgentLoop:
         self.web_search_config = web_search_config or WebSearchConfig()
         self.web_proxy = web_proxy
         self.exec_config = exec_config or ExecToolConfig()
+        self.kb_config = kb_config or KBConfig()
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
         self._start_time = time.time()
@@ -205,6 +208,7 @@ class AgentLoop:
         self.context = ContextBuilder(workspace, timezone=timezone)
         self.sessions = session_manager or SessionManager(workspace)
         self.tools = ToolRegistry()
+        self.kb_store = KnowledgeStore(workspace=workspace, max_chunk_chars=self.kb_config.max_chunk_chars)
         self.runner = AgentRunner(provider)
         self.subagents = SubagentManager(
             provider=provider,
@@ -260,6 +264,9 @@ class AgentLoop:
             ))
         self.tools.register(WebSearchTool(config=self.web_search_config, proxy=self.web_proxy))
         self.tools.register(WebFetchTool(proxy=self.web_proxy))
+        if self.kb_config.enabled:
+            self.tools.register(KBIngestTool(store=self.kb_store))
+            self.tools.register(KBSearchTool(store=self.kb_store))
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
         self.tools.register(SpawnTool(manager=self.subagents))
         if self.cron_service:
@@ -289,12 +296,30 @@ class AgentLoop:
         finally:
             self._mcp_connecting = False
 
-    def _set_tool_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
+    def _set_tool_context(
+        self,
+        channel: str,
+        chat_id: str,
+        message_id: str | None = None,
+        *,
+        sender_id: str = "",
+        session_key: str = "",
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
         """Update context for all tools that need routing info."""
         for name in ("message", "spawn", "cron"):
             if tool := self.tools.get(name):
                 if hasattr(tool, "set_context"):
                     tool.set_context(channel, chat_id, *([message_id] if name == "message" else []))
+        if kb := self.tools.get("kb_search"):
+            if hasattr(kb, "set_context"):
+                kb.set_context(
+                    channel,
+                    chat_id,
+                    sender_id=sender_id,
+                    session_key=session_key or f"{channel}:{chat_id}",
+                    metadata=metadata or {},
+                )
 
     @staticmethod
     def _strip_think(text: str | None) -> str | None:
@@ -494,7 +519,14 @@ class AgentLoop:
             key = f"{channel}:{chat_id}"
             session = self.sessions.get_or_create(key)
             await self.memory_consolidator.maybe_consolidate_by_tokens(session)
-            self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
+            self._set_tool_context(
+                channel,
+                chat_id,
+                msg.metadata.get("message_id"),
+                sender_id=msg.sender_id,
+                session_key=key,
+                metadata=msg.metadata,
+            )
             history = session.get_history(max_messages=0)
             current_role = "assistant" if msg.sender_id == "subagent" else "user"
             messages = self.context.build_messages(
@@ -526,7 +558,23 @@ class AgentLoop:
 
         await self.memory_consolidator.maybe_consolidate_by_tokens(session)
 
-        self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
+        session.metadata.update({
+            "tenant_id": msg.metadata.get("tenant_id", session.metadata.get("tenant_id", "default")),
+            "team_ids": msg.metadata.get("team_ids", session.metadata.get("team_ids", [])),
+            "sender_id": msg.sender_id,
+            "channel": msg.channel,
+            "chat_id": msg.chat_id,
+        })
+
+        merged_meta = {**session.metadata, **(msg.metadata or {})}
+        self._set_tool_context(
+            msg.channel,
+            msg.chat_id,
+            msg.metadata.get("message_id"),
+            sender_id=msg.sender_id,
+            session_key=key,
+            metadata=merged_meta,
+        )
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
                 message_tool.start_turn()
