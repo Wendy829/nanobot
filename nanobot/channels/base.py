@@ -151,6 +151,21 @@ class BaseChannel(ABC):
             return
 
         meta = metadata or {}
+        cfg_tenant = (
+            self.config.get("tenant_id", "default")
+            if isinstance(self.config, dict)
+            else getattr(self.config, "tenant_id", "default")
+        )
+        cfg_team_ids = (
+            self.config.get("team_ids", [])
+            if isinstance(self.config, dict)
+            else getattr(self.config, "team_ids", [])
+        )
+        meta = {
+            **meta,
+            "tenant_id": meta.get("tenant_id", cfg_tenant or "default"),
+            "team_ids": meta.get("team_ids", cfg_team_ids or []),
+        }
         if self.supports_streaming:
             meta = {**meta, "_wants_stream": True}
 

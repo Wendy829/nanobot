@@ -137,6 +137,14 @@ class ExecToolConfig(Base):
     timeout: int = 60
     path_append: str = ""
 
+
+class KBConfig(Base):
+    """Knowledge-base tool configuration."""
+
+    enabled: bool = False
+    max_chunk_chars: int = Field(default=1200, ge=200, le=20_000)
+
+
 class MCPServerConfig(Base):
     """MCP server connection configuration (stdio or HTTP)."""
 
@@ -154,6 +162,7 @@ class ToolsConfig(Base):
 
     web: WebToolsConfig = Field(default_factory=WebToolsConfig)
     exec: ExecToolConfig = Field(default_factory=ExecToolConfig)
+    kb: KBConfig = Field(default_factory=KBConfig)
     restrict_to_workspace: bool = False  # If true, restrict all tool access to workspace directory
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
 
